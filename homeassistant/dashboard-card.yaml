@@ -1,0 +1,88 @@
+# Range hood card: standard Home Assistant cards only (no custom cards needed).
+# Dashboard -> edit -> Add card -> Manual, then paste this.
+# Entity IDs assume the default device name "best-hood"; if Home Assistant added an area prefix
+# (e.g. switch.kitchen_best_hood_delay_off), adjust them.
+type: vertical-stack
+cards:
+  - type: tile
+    entity: fan.best_hood_fan
+    name: Hood fan
+    icon: mdi:fan
+    color: cyan
+    icon_tap_action:
+      action: toggle
+    features:
+      - type: fan-speed
+  - type: tile
+    entity: light.best_hood_light
+    name: Hood light
+    icon: mdi:lightbulb-outline
+    color: amber
+    icon_tap_action:
+      action: toggle
+  # The hood light has 4 levels: one button each (25 / 50 / 75 / 100 %).
+  - type: grid
+    columns: 4
+    square: false
+    cards:
+      - type: button
+        name: "1"
+        icon: mdi:brightness-4
+        show_state: false
+        tap_action:
+          action: perform-action
+          perform_action: light.turn_on
+          target:
+            entity_id: light.best_hood_light
+          data:
+            brightness_pct: 25
+      - type: button
+        name: "2"
+        icon: mdi:brightness-5
+        show_state: false
+        tap_action:
+          action: perform-action
+          perform_action: light.turn_on
+          target:
+            entity_id: light.best_hood_light
+          data:
+            brightness_pct: 50
+      - type: button
+        name: "3"
+        icon: mdi:brightness-6
+        show_state: false
+        tap_action:
+          action: perform-action
+          perform_action: light.turn_on
+          target:
+            entity_id: light.best_hood_light
+          data:
+            brightness_pct: 75
+      - type: button
+        name: "4"
+        icon: mdi:brightness-7
+        show_state: false
+        tap_action:
+          action: perform-action
+          perform_action: light.turn_on
+          target:
+            entity_id: light.best_hood_light
+          data:
+            brightness_pct: 100
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+      - type: tile
+        entity: switch.best_hood_delay_off
+        name: Delay off
+        icon: mdi:fan-clock
+        color: cyan
+      - type: tile
+        entity: switch.best_hood_smartsense
+        name: SmartSense
+        icon: mdi:auto-mode
+        color: green
+  - type: tile
+    entity: binary_sensor.best_hood_bluetooth
+    name: Bluetooth link

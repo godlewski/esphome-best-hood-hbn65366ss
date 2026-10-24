@@ -1,0 +1,432 @@
+# Best HBN65366SS range hood: local Bluetooth control with an ESP32 (ESPHome)
+# Based on https://github.com/WheapLabs/esphome-best-hood (best-hood-wcs1306ss.yaml @ 5036555,
+# v1.0.0), MIT License, (c) 2026 WheapLabs. See NOTICE.md. Progress log: docs/LOG.md
+#
+# How it works (protocol found by WheapLabs, light level and delay-off on this model mapped from a
+# Bluetooth capture of the BEST Kitchen app, see docs/LOG.md):
+#   1. The hood stays invisible on Bluetooth until it hears a "wake-up" advertisement:
+#      the ESP32 broadcasts it continuously (esp32_ble_server.manufacturer_data).
+#   2. The ESP32 connects, then asks for encryption WITHOUT bonding (auth "no_bond",
+#      Just Works). The hood drops the link if asked to store a bond, so encryption is
+#      redone on every connection.
+#   3. Values are ASCII digits in service ...20000:
+#        fan        ...21001 state (0/1)   ...21005 speed (0 = off, 1 to 4)
+#        light      ...21020 state (0/1)   ...21026 level (1 to 4; reads 0 while off)
+#        delay-off  ...21050 (0/1)
+#        SmartSense ...21040 (0/1)
+#      Writing a speed turns the fan on; the hood notifies every change,
+#      including changes made with its own buttons.
+#
+# Your secrets.yaml needs: wifi_ssid, wifi_password, best_hood_api_key, best_hood_ap_password,
+# best_hood_mac
+
+substitutions:
+  hood_mac: !secret best_hood_mac   # your hood's Bluetooth address (see README)
+  device_name: best-hood
+  friendly_name: Best Hood
+  svc: "47e36221-a32f-4980-bf17-341fd4f20000"
+  base: "47e36221-a32f-4980-bf17-341fd4f"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # The hood has 54 characteristics; ESP-IDF caches only 40 by default, which silently drops
+      # the last ones (light level 21026, delay-off 21050).
+      CONFIG_BT_GATTC_MAX_CACHE_CHAR: "100"
+
+logger:
+  level: INFO
+  logs:
+    esp32_ble_tracker: INFO
+    sensor: INFO
+    text_sensor: INFO
+    component: INFO
+
+api:
+  encryption:
+    key: !secret best_hood_api_key
+
+# OTA updates are encrypted and authenticated with the API key.
+ota:
+  - platform: esphome
+    encryption: {}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback hotspot (if Wi-Fi is lost) — password protected.
+  ap:
+    ssid: "Best-Hood-Fallback"
+    password: !secret best_hood_ap_password
+
+captive_portal:
+
+esp32_ble:
+  io_capability: none
+  auth_req_mode: no_bond
+
+# "Wake-up" advertisement: company ID 22117 (0x5665, little-endian) followed by the
+# 6 fixed bytes the Best Kitchen app broadcasts before connecting. Without it the
+# hood stays invisible on Bluetooth.
+esp32_ble_server:
+  manufacturer_data: [0x65, 0x56, 0xE4, 0xD6, 0x14, 0x27, 0x35, 0x47]
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+  # Finds your hood's Bluetooth address: until the ESP32 is connected, every hood whose name
+  # starts with "BEST" is logged at INFO, e.g. [hood] Found 'BEST HBN65366SS' at XX:XX:XX:XX:XX:XX.
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            if (id(hood).connected()) return;
+            if (strncmp(x.get_name().c_str(), "BEST", 4) != 0) return;
+            char mac[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
+            ESP_LOGI("hood", "Found '%s' at %s (RSSI %d)",
+                     x.get_name().c_str(), x.address_str_to(mac), x.get_rssi());
+
+globals:
+  # Last values reported by the hood; -1 = not received yet (nothing is written before that,
+  # so an ESP32 reboot never switches the hood off).
+  - id: r_fan_speed
+    type: int
+    restore_value: false
+    initial_value: "-1"
+  - id: r_light
+    type: int
+    restore_value: false
+    initial_value: "-1"
+  - id: r_light_level           # 1 to 4; 0 while the light is off
+    type: int
+    restore_value: false
+    initial_value: "-1"
+  - id: r_delay_off
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: r_smartsense
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+ble_client:
+  - mac_address: ${hood_mac}
+    id: hood
+    auto_connect: true
+    on_connect:
+      then:
+        - delay: 1s
+        - lambda: |-
+            esp_err_t err = id(hood).pair();
+            ESP_LOGI("hood", "connected, encryption requested -> %d", err);
+        # First read as soon as the link is encrypted (otherwise wait for the poll).
+        - delay: 3s
+        - component.update: t_fan_speed
+        - component.update: t_light
+        - component.update: t_light_level
+        - component.update: t_delay_off
+        - component.update: t_smartsense
+        - component.update: t_model
+    on_disconnect:
+      then:
+        - logger.log: "Hood disconnected"
+
+script:
+  # --- Writes to the hood (one ASCII digit) ---
+  - id: write_fan_speed
+    mode: queued
+    parameters:
+      n: int
+    then:
+      - ble_client.ble_write:
+          id: hood
+          service_uuid: "${svc}"
+          characteristic_uuid: "${base}21005"
+          value: !lambda 'return std::vector<uint8_t>{(uint8_t) (48 + n)};'
+  - id: write_fan_off
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: hood
+          service_uuid: "${svc}"
+          characteristic_uuid: "${base}21001"
+          value: [0x30]
+  # Same sequence as the app: switch the light on (the hood restores its last level), then set the
+  # level. 0 = off.
+  - id: write_light
+    mode: queued
+    parameters:
+      level: int
+    then:
+      - if:
+          condition:
+            lambda: 'return level == 0;'
+          then:
+            - ble_client.ble_write:
+                id: hood
+                service_uuid: "${svc}"
+                characteristic_uuid: "${base}21020"
+                value: [0x30]
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(r_light) != 1;'
+                then:
+                  - ble_client.ble_write:
+                      id: hood
+                      service_uuid: "${svc}"
+                      characteristic_uuid: "${base}21020"
+                      value: [0x31]
+                  - delay: 700ms
+            - if:
+                condition:
+                  lambda: 'return level != id(r_light_level);'
+                then:
+                  - ble_client.ble_write:
+                      id: hood
+                      service_uuid: "${svc}"
+                      characteristic_uuid: "${base}21026"
+                      value: !lambda 'return std::vector<uint8_t>{(uint8_t) (48 + level)};'
+      # Report the final state once the hood has confirmed it (sync_light waits while this runs).
+      - delay: 500ms
+      - script.execute: sync_light
+  - id: write_delay_off
+    mode: queued
+    parameters:
+      enable: bool
+    then:
+      - ble_client.ble_write:
+          id: hood
+          service_uuid: "${svc}"
+          characteristic_uuid: "${base}21050"
+          value: !lambda 'return std::vector<uint8_t>{(uint8_t) (enable ? 49 : 48)};'
+  - id: write_smartsense
+    mode: queued
+    parameters:
+      actif: bool
+    then:
+      - ble_client.ble_write:
+          id: hood
+          service_uuid: "${svc}"
+          characteristic_uuid: "${base}21040"
+          value: !lambda 'return std::vector<uint8_t>{(uint8_t) (actif ? 49 : 48)};'
+
+  # --- HA -> hood: only writes when the request differs from what the hood reports ---
+  - id: push_fan
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(r_fan_speed) < 0 || !id(hood).connected()) return;
+          int want = id(hood_fan).state ? id(hood_fan).speed : 0;
+          if (id(hood_fan).state && want < 1) want = 1;
+          if (want > 4) want = 4;
+          if (want == id(r_fan_speed)) return;
+          ESP_LOGI("hood", "fan: %d -> %d", id(r_fan_speed), want);
+          if (want == 0) id(write_fan_off).execute();
+          else id(write_fan_speed).execute(want);
+
+  # --- hood -> HA: align the entities with what the hood reports ---
+  - id: sync_fan
+    mode: restart
+    then:
+      - lambda: |-
+          int s = id(r_fan_speed);
+          if (s < 0) return;
+          int cur = id(hood_fan).state ? id(hood_fan).speed : 0;
+          if (cur == s) return;
+          if (s == 0) { auto c = id(hood_fan).turn_off(); c.perform(); }
+          else { auto c = id(hood_fan).turn_on(); c.set_speed(s); c.perform(); }
+  - id: sync_light
+    mode: restart
+    then:
+      # The level arrives a moment after the on/off state; wait so HA gets one consistent update.
+      - delay: 300ms
+      - lambda: |-
+          if (id(write_light).is_running()) return;
+          int l = id(r_light);
+          if (l < 0) return;
+          auto &v = id(hood_light).remote_values;
+          if (l == 0) {
+            if (v.is_on()) { auto c = id(hood_light).turn_off(); c.perform(); }
+            return;
+          }
+          int lvl = id(r_light_level);
+          if (lvl < 1 || lvl > 4) lvl = 4;
+          float b = lvl / 4.0f;
+          if (v.is_on() && fabsf(v.get_brightness() - b) < 0.01f) return;
+          auto c = id(hood_light).turn_on();
+          c.set_brightness(b);
+          c.perform();
+
+fan:
+  - platform: template
+    id: hood_fan
+    name: "Fan"
+    speed_count: 4
+    restore_mode: ALWAYS_OFF
+    on_state:
+      - script.execute: push_fan
+
+output:
+  # Virtual output: HA brightness -> hood level 1 to 4 (0 = off).
+  - platform: template
+    id: light_out
+    type: float
+    write_action:
+      - lambda: |-
+          if (id(r_light) < 0 || !id(hood).connected()) return;
+          int want = state <= 0.0f ? 0 : (int) ceilf(state * 4.0f - 0.01f);
+          if (want > 4) want = 4;
+          if (state > 0.0f && want < 1) want = 1;
+          int cur = id(r_light) == 1 ? id(r_light_level) : 0;
+          if (want == cur) return;
+          ESP_LOGI("hood", "light: %d -> %d", cur, want);
+          id(write_light).execute(want);
+
+light:
+  - platform: monochromatic
+    id: hood_light
+    name: "Light"
+    output: light_out
+    gamma_correct: 0
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+
+switch:
+  # restore_mode DISABLED: never replay an action at boot (Bluetooth is not ready yet).
+  - platform: template
+    name: "Delay off"
+    icon: mdi:fan-clock
+    restore_mode: DISABLED
+    lambda: 'return id(r_delay_off);'
+    turn_on_action:
+      - script.execute:
+          id: write_delay_off
+          enable: true
+    turn_off_action:
+      - script.execute:
+          id: write_delay_off
+          enable: false
+  - platform: template
+    name: "SmartSense"
+    icon: mdi:auto-mode
+    restore_mode: DISABLED
+    lambda: 'return id(r_smartsense);'
+    turn_on_action:
+      - script.execute:
+          id: write_smartsense
+          actif: true
+    turn_off_action:
+      - script.execute:
+          id: write_smartsense
+          actif: false
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+  - platform: template
+    name: "Reconnect"
+    entity_category: diagnostic
+    on_press:
+      - ble_client.disconnect: hood
+      - delay: 3s
+      - ble_client.connect: hood
+
+binary_sensor:
+  - platform: template
+    name: "Bluetooth"
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: 'return id(hood).connected() && id(r_fan_speed) >= 0;'
+
+sensor:
+  - platform: wifi_signal
+    name: "Wi-Fi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  # Hood readings (internal): notified by the hood, plus a safety poll.
+  - platform: ble_client
+    ble_client_id: hood
+    id: t_fan_speed
+    internal: true
+    service_uuid: "${svc}"
+    characteristic_uuid: "${base}21005"
+    notify: true
+    update_interval: 60s
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty() || x[0] < '0' || x[0] > '9') return;
+            id(r_fan_speed) = x[0] - '0';
+            id(sync_fan).execute();
+  - platform: ble_client
+    ble_client_id: hood
+    id: t_light
+    internal: true
+    service_uuid: "${svc}"
+    characteristic_uuid: "${base}21020"
+    notify: true
+    update_interval: 60s
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty() || (x[0] != '0' && x[0] != '1')) return;
+            id(r_light) = x[0] - '0';
+            id(sync_light).execute();
+  - platform: ble_client
+    ble_client_id: hood
+    id: t_light_level
+    internal: true
+    service_uuid: "${svc}"
+    characteristic_uuid: "${base}21026"
+    notify: true
+    update_interval: 60s
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty() || x[0] < '0' || x[0] > '4') return;
+            id(r_light_level) = x[0] - '0';
+            id(sync_light).execute();
+  - platform: ble_client
+    ble_client_id: hood
+    id: t_delay_off
+    internal: true
+    service_uuid: "${svc}"
+    characteristic_uuid: "${base}21050"
+    notify: true
+    update_interval: 60s
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty()) return;
+            id(r_delay_off) = x[0] == '1';
+  - platform: ble_client
+    ble_client_id: hood
+    id: t_smartsense
+    internal: true
+    service_uuid: "${svc}"
+    characteristic_uuid: "${base}21040"
+    notify: true
+    update_interval: 60s
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty()) return;
+            id(r_smartsense) = x[0] == '1';
+  - platform: ble_client
+    ble_client_id: hood
+    id: t_model
+    name: "Model"
+    service_uuid: "${svc}"
+    characteristic_uuid: "${base}11065"
+    update_interval: 3600s
+    entity_category: diagnostic
